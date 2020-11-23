@@ -7,6 +7,9 @@ class SaleOrderLine(models.Model):
     _inherit = 'sale.order.line'
 
     decoration_method = fields.Char('Decoration Method', compute='_get_deco_method', store=True, help='Decoration method used on the sale order line')
+    material_cost = fields.Float('Material Cost')
+    labor_cost = fields.Float('Labor Cost')
+    overhead_cost = fields.Float('Overhead Cost')
     # printed_date = fields.Datetime(string="Date")
     @api.multi
     @api.depends('product_no_variant_attribute_value_ids')
@@ -21,21 +24,42 @@ class SaleOrderLine(models.Model):
                     line.decoration_method = attribute.name
 
     def _compute_bom_cost(self, product_id):
-        price = 0.0
+        mtl = 0.0
+        lab = 0.0
+        ovh_pct = 0
+        ovh = 0.0
+        include_line = False
         for line in product_id.product_tmpl_id.bom_id.bom_line_ids:
+            include_line = False
+            # Determine if the line should be included in cost calculation
             if line.attribute_value_ids:
                 if (set(self.product_id.attribute_value_ids.ids) & set(line.attribute_value_ids.ids) or
                     set(self.product_no_variant_attribute_value_ids.product_attribute_value_id.ids) & set(line.attribute_value_ids.ids)):
-                    price += (line.product_id.standard_price * line.product_qty)
+                    include_line = True
             else:
-                price += (line.product_id.standard_price * line.product_qty)
-        return price
+                include_line = True
+            # If cost should be included
+            if include_line:
+                # Products of type 'product' (Storeable Product) or 'consu' (Consumable) will be added to the material bucket
+                if line.product_id.product_tmpl_id.type == 'product' or line.product_id.product_tmpl_id.type == 'consu':
+                    mtl += (line.product_id.standard_price * line.product_qty)
+                # Service products without a overhead percentage will be added to the labor bucket
+                elif line.product_id.product_tmpl_id.overhead_percent == 0:
+                    lab += (line.product_id.standard_price * line.product_qty)
+                # Take the first non-zero serivce product with an overhead percent as the overhead percentage amount to be applied.
+                elif line.product_id.product_tmpl_id.overhead_percent != 0 and ovh_pct == 0:
+                    ovh_pct = line.product_id.product_tmpl_id.overhead_percent
+
+        # Before returning multiple the labor by the overhead percentage to get overhead
+        ovh = lab * (ovh_pct/100)
+
+        return [mtl, lab, ovh]
 
     def _compute_margin(self, order_id, product_id, product_uom_id):
         frm_cur = self.env.user.company_id.currency_id
         to_cur = order_id.pricelist_id.currency_id
         if product_id.product_tmpl_id.bom_id:
-            purchase_price = self._compute_bom_cost(product_id)
+            purchase_price = sum(self._compute_bom_cost(product_id))
         else:
             purchase_price = product_id.standard_price
         if product_uom_id != product_id.uom_id:
@@ -50,7 +74,7 @@ class SaleOrderLine(models.Model):
         frm_cur = self.env.user.company_id.currency_id
         to_cur = pricelist.currency_id
         if product.product_tmpl_id.bom_id:
-            purchase_price = self._compute_bom_cost(product)
+            purchase_price = sum(self._compute_bom_cost(product))
         else:
             purchase_price = product.standard_price
         if product_uom != product.uom_id:
@@ -60,3 +84,42 @@ class SaleOrderLine(models.Model):
             self.order_id.company_id or self.env.user.company_id,
             date or fields.Date.today(), round=False)
         return {'purchase_price': price}
+
+    @api.multi
+    def write(self, values):
+        # Get the bom cost
+        cost = self._compute_bom_cost(self.product_id)
+        values['material_cost'] = cost[0]
+        values['labor_cost'] = cost[1]
+        values['overhead_cost'] = cost[2]
+
+        result = super(SaleOrderLine, self).write(values)
+        return result
+
+class ProductCategory(models.Model):
+    _inherit = 'product.category'
+
+    overhead_percent = fields.Float(string="Overhead Percent")
+
+
+class ProductTemplate(models.Model):
+    _inherit = 'product.template'
+
+    overhead_percent = fields.Float(string="Overhead Percent", compute="_get_overhead_percent", stored=True)
+
+    def _get_overhead_percent(self):
+        for product in self:
+            # The overhead percent will come from the most specific to least specific product category
+            cat = product.categ_id
+            while cat:
+                if cat.overhead_percent:
+                    product.overhead_percent = cat.overhead_percent
+                    break
+                cat = cat.parent_id
+
+
+class BOMLine(models.Model):
+    _inherit = 'mrp.bom.line'
+
+    cost = fields.Float(related="product_id.standard_price", store=False, name='Cost')
+    overhead_percent = fields.Float(related="product_id.product_tmpl_id.overhead_percent", store=False, name='Overhead Percent')
