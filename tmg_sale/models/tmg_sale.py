@@ -27,6 +27,7 @@ class SaleOrderLine(models.Model):
         mtl = 0.0
         lab = 0.0
         ovh_pct = 0
+        scrap_pct = 0.0
         ovh = 0.0
         include_line = False
         for line in product_id.product_tmpl_id.bom_id.bom_line_ids:
@@ -43,15 +44,26 @@ class SaleOrderLine(models.Model):
                 # Products of type 'product' (Storeable Product) or 'consu' (Consumable) will be added to the material bucket
                 if line.product_id.product_tmpl_id.type == 'product' or line.product_id.product_tmpl_id.type == 'consu':
                     mtl += (line.product_id.standard_price * line.product_qty)
-                # Service products without a overhead percentage will be added to the labor bucket
-                elif line.product_id.product_tmpl_id.overhead_percent == 0:
+                # Products marked with 'labor' cost calc type will be added to the labor bucket
+                elif line.product_id.product_tmpl_id.cost_calc_type == 'labor':
                     lab += (line.product_id.standard_price * line.product_qty)
-                # Take the first non-zero serivce product with an overhead percent as the overhead percentage amount to be applied.
-                elif line.product_id.product_tmpl_id.overhead_percent != 0 and ovh_pct == 0:
+                # Take the first product marked as using overhead cost calc
+                # with an overhead percent as the overhead percentage amount to be applied.
+                elif (line.product_id.product_tmpl_id.cost_calc_type == 'overhead' and
+                        line.product_id.product_tmpl_id.overhead_percent != 0 and
+                        ovh_pct == 0):
                     ovh_pct = line.product_id.product_tmpl_id.overhead_percent
+                # Take the first product marked as using scrap cost calc
+                # with an overhead percent as the overhead percentage amount to be applied.
+                elif (line.product_id.product_tmpl_id.cost_calc_type == 'scrap' and
+                        line.product_id.product_tmpl_id.scrap_percent != 0 and
+                        scrap_pct == 0):
+                    scrap_pct = line.product_id.product_tmpl_id.scrap_percent
 
         # Before returning multiple the labor by the overhead percentage to get overhead
+        # and material by the scrap percentage
         ovh = lab * (ovh_pct/100)
+        mtl += mtl * (scrap_pct/100)
 
         return [mtl, lab, ovh]
 
@@ -100,12 +112,19 @@ class ProductCategory(models.Model):
     _inherit = 'product.category'
 
     overhead_percent = fields.Float(string="Overhead Percent")
+    scrap_percent = fields.Float(string="Scrap Percent")
 
 
 class ProductTemplate(models.Model):
     _inherit = 'product.template'
 
+    cost_calc_type = fields.Selection([
+            ('labor', 'Labor'),
+            ('overhead', 'Overhead'),
+            ('scrap', 'Scrap')
+        ], string="Cost Calculation Type")
     overhead_percent = fields.Float(string="Overhead Percent", compute="_get_overhead_percent", stored=True)
+    scrap_percent = fields.Float(string="Scrap Percent", compute="_get_scrap_percent", stored=True)
 
     def _get_overhead_percent(self):
         for product in self:
@@ -117,9 +136,28 @@ class ProductTemplate(models.Model):
                     break
                 cat = cat.parent_id
 
+    def _get_scrap_percent(self):
+        for product in self:
+            # The scrap percent will come from the most specific to least specific product category
+            cat = product.categ_id
+            while cat:
+                if cat.scrap_percent:
+                    product.scrap_percent = cat.scrap_percent
+                    break
+                cat = cat.parent_id
+
 
 class BOMLine(models.Model):
     _inherit = 'mrp.bom.line'
 
     cost = fields.Float(related="product_id.standard_price", store=False, name='Cost')
-    overhead_percent = fields.Float(related="product_id.product_tmpl_id.overhead_percent", store=False, name='Overhead Percent')
+    calc_percent = fields.Float(compute="_get_calc_percent", store=False, name='Cost Calc %')
+
+    def _get_calc_percent(self):
+        for line in self:
+            if not line.product_id.cost_calc_type:
+                line.calc_percent = 0
+            elif line.product_id.cost_calc_type == 'overhead':
+                line.calc_percent = line.product_id.overhead_percent
+            elif line.product_id.cost_calc_type == 'scrap':
+                line.calc_percent = line.product_id.scrap_percent
