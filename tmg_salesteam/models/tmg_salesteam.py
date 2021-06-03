@@ -23,6 +23,18 @@ class tmg_salesteam(models.Model):
             result.append((team.id, "%s (%s)" % (team.name, team.user_id.name if team.user_id.name else "N/A")))
         return result
 
+class tmg_crmlead(models.Model):
+    _inherit = 'crm.lead'
+
+    # Disable changing sales team when user is changed
+    @api.onchange('user_id')
+    def _onchange_user_id(self):
+        return
+
+    @api.constrains('user_id')
+    @api.multi
+    def _valid_team(self):
+        return
 
 class tmg_team_users(models.Model):
     _inherit = 'res.users'
